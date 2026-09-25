@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { useEffect } from "react";
+import { useEffect, useId } from "react";
 
 type Props = {
   open: boolean;
@@ -24,6 +24,9 @@ export function Modal({
   closeLabel = "Close",
   maxWidthClassName = "w-[min(96vw,26rem)]",
 }: Props) {
+  const titleId = useId();
+  const subtitleId = useId();
+
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -47,14 +50,19 @@ export function Modal({
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="ui-modal-title"
+        aria-labelledby={titleId}
+        aria-describedby={subtitle ? subtitleId : undefined}
       >
         <div className="flex shrink-0 items-start justify-between gap-3 border-b border-white/10 px-4 py-3">
           <div className="min-w-0">
-            <h2 id="ui-modal-title" className="ui-title text-base font-semibold text-white/95">
+            <h2 id={titleId} className="ui-title text-base font-semibold text-white/95">
               {title}
             </h2>
-            {subtitle ? <p className="ui-meta mt-0.5">{subtitle}</p> : null}
+            {subtitle ? (
+              <p id={subtitleId} className="ui-meta mt-0.5">
+                {subtitle}
+              </p>
+            ) : null}
           </div>
           <button
             type="button"
@@ -74,7 +82,7 @@ export function Modal({
             </svg>
           </button>
         </div>
-        <div className="custom-scrollbar min-h-0 flex-1 overflow-visible px-4 py-3">
+        <div className="custom-scrollbar min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-4 py-3">
           {children}
         </div>
         {footer ? (

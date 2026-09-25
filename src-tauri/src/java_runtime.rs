@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
@@ -100,6 +100,33 @@ fn java_home_from_bin(bin: &Path) -> Option<PathBuf> {
     bin.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())
 }
 
+fn manifest_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let normalized = relative.trim_end_matches('/');
+    if normalized.is_empty()
+        || relative.contains('\\')
+        || matches!(
+            normalized.split('/').next(),
+            Some(".complete" | ".complete.tmp")
+        )
+        || normalized
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(format!("Недопустимый путь в манифесте Java: {relative}"));
+    }
+
+    let path = Path::new(relative);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(format!("Недопустимый путь в манифесте Java: {relative}"));
+    }
+
+    Ok(root.join(path))
+}
+
 fn is_valid_file(p: &Path) -> bool {
     fs::metadata(p).map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
 }
@@ -182,6 +209,12 @@ pub fn list_installed_runtimes() -> Result<Vec<JavaRuntimeInfo>, String> {
 
 fn resolve_existing(major: u8, component: &str) -> Result<Option<PathBuf>, String> {
     let dir = runtime_dir(major, component)?;
+    let marker = dir.join(".complete");
+    let expected_marker = format!("16Launcher Java runtime {major}\n");
+    if fs::read_to_string(&marker).ok().as_deref() != Some(expected_marker.as_str()) {
+        return Ok(None);
+    }
+
     let bin = java_bin_path(&dir);
     if !bin.is_file() { return Ok(None); }
     
@@ -200,7 +233,7 @@ fn verify_cache(path: &Path, size: u64, sha1: &str) -> Result<bool, String> {
     };
     if size > 0 && meta.len() != size { return Ok(false); }
     
-    if !sha1.is_empty() && (size == 0 || meta.len() <= 256 * 1024) {
+    if !sha1.is_empty() {
         return Ok(compute_sha1(path)?.eq_ignore_ascii_case(sha1));
     }
     Ok(size > 0 && meta.len() == size)
@@ -210,11 +243,25 @@ fn compute_sha1(path: &Path) -> Result<String, String> {
     let mut f = File::open(path).map_err(|e| e.to_string())?;
     let mut h = Sha1::new();
     let mut buf = [0u8; 8192];
-    while let Ok(n) = f.read(&mut buf) {
+    loop {
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 { break; }
         h.update(&buf[..n]);
     }
     Ok(format!("{:x}", h.finalize()))
+}
+
+struct TemporaryDownload {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl Drop for TemporaryDownload {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -233,6 +280,12 @@ pub async fn ensure_java_runtime(major: u8, component: &str) -> Result<PathBuf, 
         eprintln!("[Java] Найден готовый Java {}: {}", major, path.display());
         return Ok(path);
     }
+
+    let root = runtime_dir(major, component)?;
+    let marker = root.join(".complete");
+    let marker_tmp = root.join(".complete.tmp");
+    let _ = fs::remove_file(&marker);
+    let _ = fs::remove_file(&marker_tmp);
 
     let platform = detect_platform()?;
     eprintln!("[Java] Установка Java {} ({}) для {}", major, component, platform);
@@ -258,7 +311,6 @@ pub async fn ensure_java_runtime(major: u8, component: &str) -> Result<PathBuf, 
         .map_err(|e| e.to_string())?
         .json().await.map_err(|e| e.to_string())?;
 
-    let root = runtime_dir(major, component)?;
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
 
     let mut files: Vec<_> = manifest.files.into_iter().collect();
@@ -267,8 +319,8 @@ pub async fn ensure_java_runtime(major: u8, component: &str) -> Result<PathBuf, 
     });
 
     for (rel_path, entry) in files {
-        let dest = root.join(&rel_path);
         let e_type = entry.entry_type.as_deref().unwrap_or("file");
+        let dest = manifest_path(&root, &rel_path)?;
 
         if e_type == "directory" && entry.downloads.is_none() {
             fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
@@ -291,6 +343,10 @@ pub async fn ensure_java_runtime(major: u8, component: &str) -> Result<PathBuf, 
 
         let tmp = dest.with_extension("download");
         let _ = fs::remove_file(&tmp);
+        let mut temporary_download = TemporaryDownload {
+            path: tmp.clone(),
+            committed: false,
+        };
 
         let mut resp = client.get(&raw.url).send().await.map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
@@ -318,6 +374,7 @@ pub async fn ensure_java_runtime(major: u8, component: &str) -> Result<PathBuf, 
         }
 
         fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+        temporary_download.committed = true;
         #[cfg(unix)] if entry.executable { let _ = set_executable(&dest, true); }
     }
 
@@ -328,6 +385,10 @@ pub async fn ensure_java_runtime(major: u8, component: &str) -> Result<PathBuf, 
     if !is_runtime_ready(&home, major) {
         return Err("Установленная Java повреждена".into());
     }
+
+    fs::write(&marker_tmp, format!("16Launcher Java runtime {major}\n"))
+        .map_err(|e| e.to_string())?;
+    fs::rename(&marker_tmp, &marker).map_err(|e| e.to_string())?;
 
     eprintln!("[Java] Готово: {}", bin.display());
     Ok(bin)
@@ -349,4 +410,65 @@ pub fn ensure_executable(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_file_path() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "16launcher-java-runtime-test-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn manifest_paths_must_stay_relative_to_runtime_root() {
+        let root = Path::new("/runtime");
+
+        assert_eq!(
+            manifest_path(root, "lib/server/library.jar").unwrap(),
+            root.join("lib/server/library.jar")
+        );
+        assert!(manifest_path(root, "../outside").is_err());
+        assert!(manifest_path(root, "lib/../../outside").is_err());
+        assert!(manifest_path(root, "/outside").is_err());
+        assert!(manifest_path(root, "lib\\..\\outside").is_err());
+        assert!(manifest_path(root, "lib//library.jar").is_err());
+        assert!(manifest_path(root, ".complete").is_err());
+        assert!(manifest_path(root, ".complete/").is_err());
+    }
+
+    #[test]
+    fn cache_verification_checks_hashes_for_large_files() {
+        let path = test_file_path();
+        let contents = vec![0x5a; 256 * 1024 + 1];
+        fs::write(&path, &contents).unwrap();
+
+        let result = verify_cache(&path, contents.len() as u64, "00000000");
+        let _ = fs::remove_file(&path);
+
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn temporary_download_is_removed_when_not_committed() {
+        let path = test_file_path();
+        fs::write(&path, b"partial").unwrap();
+
+        {
+            let _temporary = TemporaryDownload {
+                path: path.clone(),
+                committed: false,
+            };
+        }
+
+        assert!(!path.exists());
+    }
 }
